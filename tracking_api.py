@@ -2,11 +2,13 @@ from cv2 import rectangle, VideoCapture, TrackerKCF_create, legacy_TrackerMedian
 from dropbox import Dropbox
 from dropbox.files import WriteMode
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from uuid import uuid4
 from os import remove, environ
 from requests import get
 # Global scope variables and objects are defined below:
 DROPBOX_TOKEN, app = environ.get("DROPBOX_TOKEN"), Flask(__name__)
+CORS(app)
 # The method below aims at uploading the processed image / sequence video signal to Dropbox
 def upload_to_dropbox(file_path, dropbox_path):
     dbx = Dropbox(DROPBOX_TOKEN)
