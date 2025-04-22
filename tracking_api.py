@@ -3,26 +3,18 @@ import cv2
 import os
 import uuid
 import urllib.request
+import dropbox
+
+DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
 app = Flask(__name__)
 
-# Download GOTURN model if needed
-def download_goturn_model():
-    model_url = 'https://www.dropbox.com/scl/fi/gokz9sv1bczhsok8cpsiv/goturn.caffemodel?rlkey=hhc0b1b4jnu3053kdy9nisdbw&dl=1'
-    prototxt_url = 'https://www.dropbox.com/scl/fi/cl2urkldmg7rss15haf4u/goturn.prototxt?rlkey=vnuods7f7y59e7xxeljanrtn4&dl=1'
-
-    if not os.path.isfile('goturn.caffemodel'):
-        urllib.request.urlretrieve(model_url, 'goturn.caffemodel')
-    if not os.path.isfile('goturn.prototxt'):
-        urllib.request.urlretrieve(prototxt_url, 'goturn.prototxt')
-
-def drawRectangle(frame, bbox):
-    p1 = (round(bbox[0]), round(bbox[1]))
-    p2 = (round(bbox[0] + bbox[2]), round(bbox[1] + bbox[3]))
-    cv2.rectangle(frame, p1, p2, (255, 0, 0), 2, 1)
-
-def drawText(frame, txt, location, color = (50, 170, 50)):
-    cv2.putText(frame, txt, location, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+def upload_to_dropbox(local_path, dropbox_dest_path):
+    dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+    with open(local_path, 'rb') as f:
+        dbx.files_upload(f.read(), dropbox_dest_path, mode=dropbox.files.WriteMode.overwrite)
+    shared_link_metadata = dbx.sharing_create_shared_link_with_settings(dropbox_dest_path)
+    return shared_link_metadata.url.replace('?dl=0', '?raw=1')
 
 @app.route('/track', methods=['POST'])
 def track():
@@ -34,58 +26,60 @@ def track():
     if not (video_path and bbox):
         return jsonify({"error": "Missing video_path or bbox"}), 400
 
-    tmp_filename = f"video_{uuid.uuid4()}.mp4"
+    local_video = f"input_{uuid.uuid4()}.mp4"
     try:
-        urllib.request.urlretrieve(video_path, tmp_filename)
-    except Exception as e:
-        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+        urllib.request.urlretrieve(video_path, local_video)
+    except:
+        return jsonify({"error": "Failed to download video"}), 400
 
-    if tracker_type == 'GOTURN':
-        download_goturn_model()
+    # Create tracker
+    if tracker_type == 'BOOSTING':
+        tracker = cv2.legacy_TrackerBoosting.create()
+    elif tracker_type == 'MIL':
+        tracker = cv2.TrackerMIL_create()
+    elif tracker_type == 'KCF':
+        tracker = cv2.TrackerKCF_create()
+    elif tracker_type == 'CSRT':
+        tracker = cv2.legacy_TrackerCSRT.create()
+    elif tracker_type == 'TLD':
+        tracker = cv2.legacy_TrackerTLD.create()
+    elif tracker_type == 'MEDIANFLOW':
+        tracker = cv2.legacy_TrackerMedianFlow.create()
+    elif tracker_type == 'GOTURN':
+        tracker = cv2.TrackerGOTURN_create()
+    else:
+        tracker = cv2.legacy_TrackerMOSSE.create()
 
-    # Tracker selector
-    try:
-        if tracker_type == 'BOOSTING':
-            tracker = cv2.legacy.TrackerBoosting_create()
-        elif tracker_type == 'MIL':
-            tracker = cv2.TrackerMIL_create()
-        elif tracker_type == 'KCF':
-            tracker = cv2.TrackerKCF_create()
-        elif tracker_type == 'CSRT':
-            tracker = cv2.legacy.TrackerCSRT_create()
-        elif tracker_type == 'TLD':
-            tracker = cv2.legacy.TrackerTLD_create()
-        elif tracker_type == 'MEDIANFLOW':
-            tracker = cv2.legacy.TrackerMedianFlow_create()
-        elif tracker_type == 'GOTURN':
-            tracker = cv2.TrackerGOTURN_create()
-        else:
-            tracker = cv2.legacy.TrackerMOSSE_create()
-    except Exception as e:
-        return jsonify({"error": "Tracker error: " + str(e)}), 500
-
-    cap = cv2.VideoCapture(tmp_filename)
+    cap = cv2.VideoCapture(local_video)
     ok, frame = cap.read()
     if not ok:
-        return jsonify({"error": "Could not read video"}), 500
+        return jsonify({"error": "Failed to read video"}), 500
 
     ok = tracker.init(frame, tuple(bbox))
 
-    frame_count = 0
-    while frame_count < 20:
+    output_filename = f"tracked_{uuid.uuid4()}.mp4"
+    out = cv2.VideoWriter(output_filename, cv2.VideoWriter_fourcc(*'mp4v'), 30.0, (frame.shape[1], frame.shape[0]))
+
+    while True:
         ok, frame = cap.read()
         if not ok:
             break
         ok, bbox = tracker.update(frame)
         if ok:
-            drawRectangle(frame, bbox)
-        else:
-            drawText(frame, "Tracking failed", (80, 140), (0, 0, 255))
-        frame_count += 1
+            p1 = (int(bbox[0]), int(bbox[1]))
+            p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
+            cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
+        out.write(frame)
 
     cap.release()
-    os.remove(tmp_filename)
-    return jsonify({"status": "Success — processed 20 frames"})
+    out.release()
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    dropbox_path = f"/{output_filename}"
+    try:
+        shared_url = upload_to_dropbox(output_filename, dropbox_path)
+        os.remove(output_filename)
+        os.remove(local_video)
+        return jsonify({"status": "success", "video_url": shared_url})
+    except Exception as e:
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
