@@ -2,4 +2,5 @@ flask
 opencv-contrib-python==4.7.0.68
 gunicorn
 numpy<2.0
+requests
 dropbox

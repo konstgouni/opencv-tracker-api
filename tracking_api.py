@@ -1,23 +1,48 @@
 from flask import Flask, request, jsonify
 import cv2
-import os
 import uuid
-import urllib.request
+import os
+import requests
 import dropbox
+import urllib.request
 
 app = Flask(__name__)
 
-# 🔐 Get Dropbox token from Render Environment Variables
+# 🔐 From Render's Environment Variables
 DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-def upload_to_dropbox(local_path, dropbox_dest_path):
-    dbx = dropbox.Dropbox(DROPBOX_TOKEN)
-    with open(local_path, 'rb') as f:
-        dbx.files_upload(f.read(), dropbox_dest_path, mode=dropbox.files.WriteMode.overwrite)
-    shared_link_metadata = dbx.sharing_create_shared_link_with_settings(dropbox_dest_path)
-    return shared_link_metadata.url.replace('?dl=0', '?raw=1')
+# ✅ GOTURN Model Downloader
+def download_goturn_model():
+    model_url = "https://www.dropbox.com/scl/fi/gokz9sv1bczhsok8cpsiv/goturn.caffemodel?rlkey=hhc0b1b4jnu3053kdy9nisdbw&dl=1"
+    prototxt_url = "https://www.dropbox.com/scl/fi/cl2urkldmg7rss15haf4u/goturn.prototxt?rlkey=vnuods7f7y59e7xxeljanrtn4&dl=1"
 
-@app.route('/track', methods=['POST'])
+    if not os.path.exists("goturn.caffemodel"):
+        print("📥 Downloading goturn.caffemodel...")
+        urllib.request.urlretrieve(model_url, "goturn.caffemodel")
+
+    if not os.path.exists("goturn.prototxt"):
+        print("📥 Downloading goturn.prototxt...")
+        urllib.request.urlretrieve(prototxt_url, "goturn.prototxt")
+
+# ✅ Upload tracked video to Dropbox
+def upload_to_dropbox(file_path, dropbox_path):
+    dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+    with open(file_path, "rb") as f:
+        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+    link = dbx.sharing_create_shared_link_with_settings(dropbox_path)
+    return link.url.replace("?dl=0", "?raw=1")
+
+# ✅ Drawing utilities
+def draw_rectangle(frame, bbox):
+    p1 = (round(bbox[0]), round(bbox[1]))
+    p2 = (round(bbox[0] + bbox[2]), round(bbox[1] + bbox[3]))
+    cv2.rectangle(frame, p1, p2, (255, 0, 0), 2)
+
+def draw_text(frame, text, location, color=(50, 170, 50)):
+    cv2.putText(frame, text, location, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+# ✅ API Endpoint
+@app.route("/track", methods=["POST"])
 def track():
     data = request.json
     video_url = data.get("video_path")
@@ -27,74 +52,83 @@ def track():
     if not (video_url and bbox):
         return jsonify({"error": "Missing video_path or bbox"}), 400
 
-    local_input = f"input_{uuid.uuid4()}.mp4"
-    local_output = f"tracked_{uuid.uuid4()}.mp4"
-
+    # 🔽 Download the video from URL
     try:
-        urllib.request.urlretrieve(video_url, local_input)
+        local_video = f"input_{uuid.uuid4()}.mp4"
+        r = requests.get(video_url, stream=True)
+        with open(local_video, 'wb') as f:
+            for chunk in r.iter_content(1024):
+                f.write(chunk)
     except Exception as e:
-        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+        return jsonify({"error": f"Video download failed: {str(e)}"}), 500
 
+    # ✅ Tracker Selection
     try:
         if tracker_type == 'BOOSTING':
-            tracker = cv2.legacy_TrackerBoosting.create()
+            tracker = cv2.legacy.TrackerBoosting_create()
         elif tracker_type == 'MIL':
             tracker = cv2.TrackerMIL_create()
         elif tracker_type == 'KCF':
             tracker = cv2.TrackerKCF_create()
         elif tracker_type == 'CSRT':
-            tracker = cv2.legacy_TrackerCSRT.create()
+            tracker = cv2.legacy.TrackerCSRT_create()
         elif tracker_type == 'TLD':
-            tracker = cv2.legacy_TrackerTLD.create()
+            tracker = cv2.legacy.TrackerTLD_create()
         elif tracker_type == 'MEDIANFLOW':
-            tracker = cv2.legacy_TrackerMedianFlow.create()
+            tracker = cv2.legacy.TrackerMedianFlow_create()
         elif tracker_type == 'GOTURN':
+            download_goturn_model()
             tracker = cv2.TrackerGOTURN_create()
         else:
-            tracker = cv2.legacy_TrackerMOSSE.create()
+            tracker = cv2.legacy.TrackerMOSSE_create()
     except Exception as e:
-        return jsonify({"error": "Tracker error: " + str(e)}), 500
+        return jsonify({"error": f"Tracker init failed: {str(e)}"}), 500
 
-    cap = cv2.VideoCapture(local_input)
+    cap = cv2.VideoCapture(local_video)
     ok, frame = cap.read()
     if not ok:
+        cap.release()
+        os.remove(local_video)
         return jsonify({"error": "Failed to read video"}), 500
 
     tracker.init(frame, tuple(bbox))
-    out = cv2.VideoWriter(local_output, cv2.VideoWriter_fourcc(*'mp4v'), 30.0, (frame.shape[1], frame.shape[0]))
 
-    # ⛔ Render safe: limit processing to 50 frames
-    frame_limit = 50
+    output_video = f"tracked_{uuid.uuid4()}.mp4"
+    out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*'mp4v'), 30.0, (frame.shape[1], frame.shape[0]))
+
     frame_count = 0
+    max_frames = 50  # Adjust if needed to avoid Render timeouts
 
-    while frame_count < frame_limit:
+    while frame_count < max_frames:
         ok, frame = cap.read()
         if not ok:
             break
         ok, bbox = tracker.update(frame)
         if ok:
-            p1 = (int(bbox[0]), int(bbox[1]))
-            p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-            cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
+            draw_rectangle(frame, bbox)
+        else:
+            draw_text(frame, "Tracking failed", (50, 80), (0, 0, 255))
+        draw_text(frame, f"{tracker_type} Tracker", (50, 50))
         out.write(frame)
         frame_count += 1
 
     cap.release()
     out.release()
+    os.remove(local_video)
 
     try:
-        dropbox_path = f"/{local_output}"
-        public_url = upload_to_dropbox(local_output, dropbox_path)
-        os.remove(local_input)
-        os.remove(local_output)
+        dropbox_url = upload_to_dropbox(output_video, f"/tracked/{output_video}")
+        os.remove(output_video)
         return jsonify({
-            "status": f"Success — processed {frame_count} frames",
-            "video_url": public_url
+            "status": "done",
+            "tracker": tracker_type,
+            "frames_processed": frame_count,
+            "video_url": dropbox_url
         })
     except Exception as e:
-        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+        return jsonify({"error": f"Dropbox upload failed: {str(e)}"}), 500
 
+# ✅ Run local (for testing, won't run on Render)
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-
+    app.run(host="0.0.0.0", port=5000)
 
