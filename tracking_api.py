@@ -74,8 +74,12 @@ def track():
 
         print("📤 Uploading result to Dropbox...")
         dropbox_path = f"/tracked/{output_video}"
-        public_link = upload_to_dropbox(output_video, dropbox_path)
-        os.remove(output_video)
+        try:
+            public_link = upload_to_dropbox(output_video, dropbox_path)
+            os.remove(output_video)
+        except Exception as e:
+            print("❌ Dropbox upload failed:", str(e))
+            return jsonify({"error": f"Dropbox upload failed: {str(e)}"}), 500
 
         return jsonify({
             "status": "done",
